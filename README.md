@@ -23,6 +23,22 @@ A sidecar plugin for [gray](https://github.com/vstaln/gray), scaffolded by
 Errors are friendly: HTTP status codes and curl errors come back as tool
 errors, never a panic.
 
+## Other tools
+
+Ported from pi's `web-access` extension (MIT):
+
+- `pdf_extract` — `{url_or_path, pages?}`: download or open a PDF, extract
+  text with `pdftotext -f N -l N` (poppler) or `python3` + `pypdf`; without
+  either it errors with an install hint. `pages` like `"1-5"`/`"3"`, output
+  capped at 30k chars (head+tail).
+- `youtube_transcript` — `{url}`: `yt-dlp --skip-download --write-subs
+  --sub-langs en --convert-subs srt` into a tmpdir, then the `.srt` text;
+  fallback scrapes `captionTracks` timedtext URLs from the watch page.
+  Errors carry a yt-dlp install hint.
+- `gh_clone` — `{repo, dest?}`: shallow `git clone --depth 1` of
+  `owner/name` (or a git URL) into `~/.gray/browse/repos/<name>`; replies
+  with the path and file count, `dest` overrides the target.
+
 ## Wire methods
 
 `plugin/manifest`, `plugin/shutdown`, `tool/call`. No hooks, no commands,
