@@ -1,8 +1,16 @@
-# gray-browse
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+</p>
+<h1 align="center">gray-browse</h1>
+<p align="center">Keyless web fetch — read pages, extract PDFs and YouTube transcripts, clone repos.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-browse/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
 Keyless web fetch: `read`/`links`/`raw` a URL via curl, with an optional
-Firecrawl provider for JS-heavy pages. Port of the keyless half of hermes's
-browser plugins (`browser/firecrawl`, `browser/browser_use`).
+Firecrawl provider for JS-heavy pages.
 
 A sidecar plugin for [gray](https://github.com/vstaln/gray), scaffolded by
 [gray-account](https://github.com/vstaln/gray-account).
@@ -24,8 +32,6 @@ Errors are friendly: HTTP status codes and curl errors come back as tool
 errors, never a panic.
 
 ## Other tools
-
-Ported from pi's `web-access` extension (MIT):
 
 - `pdf_extract` — `{url_or_path, pages?}`: download or open a PDF, extract
   text with `pdftotext -f N -l N` (poppler) or `python3` + `pypdf`; without
@@ -60,3 +66,7 @@ gray account publish    # check → build → release → publish to the gray re
 
 Bump `version` in `Cargo.toml` before each `publish`; the registry refuses to
 republish a version.
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>
