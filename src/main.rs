@@ -12,9 +12,11 @@
 //! friendly: the HTTP status is reported, never a panic.
 //!
 //! Plus three tools ported from pi's web-access extension (MIT):
-//! `pdf_extract` (pdftotext / python3+pypdf, page ranges, 30k head+tail cap),
-//! `youtube_transcript` (yt-dlp subtitles, timedtext watch-page fallback) and
-//! `gh_clone` (shallow clone into ~/.gray/browse/repos/).
+//! `browse_pdf` (pdftotext / python3+pypdf / built-in lopdf, page ranges,
+//! output over 30k chars spills to ~/.gray/browse/pdf/), `browse_youtube`
+//! (yt-dlp subtitles, timedtext watch-page fallback) and `gh_clone` (shallow
+//! clone into ~/.gray/browse/repos/). The pre-0.3 names `pdf_extract` and
+//! `youtube_transcript` still dispatch as aliases.
 
 use std::io::{BufRead, Read, Write};
 
@@ -45,8 +47,8 @@ fn manifest() -> Value {
                 "required": ["url"]
             }
         }, {
-            "name": "pdf_extract",
-            "description": "Extract text from a PDF at a URL or local path. 'pages' like \"1-5\" or \"3\" limits the range. Uses pdftotext (poppler) when on PATH, else python3+pypdf. Output capped at 30k chars (head+tail).",
+            "name": "browse_pdf",
+            "description": "Extract text from a PDF at a URL or local path. 'pages' like \"1-5\" or \"3\" limits the range. Uses pdftotext (poppler) when on PATH, else python3+pypdf, else a built-in Rust (lopdf) fallback. Output over 30k chars spills to a file under ~/.gray/browse/pdf/; the reply names it and shows head+tail.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -56,8 +58,8 @@ fn manifest() -> Value {
                 "required": ["url_or_path"]
             }
         }, {
-            "name": "youtube_transcript",
-            "description": "Fetch a video's transcript: yt-dlp subtitles (srt) when yt-dlp is on PATH, else timedtext tracks scraped from the YouTube watch page.",
+            "name": "browse_youtube",
+            "description": "Fetch a video's transcript: yt-dlp subtitles (srt) when yt-dlp is on PATH, else timedtext tracks scraped from the YouTube watch page. Returns [m:ss] timestamped text.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -524,8 +526,8 @@ fn firecrawl(url: &str, key: &str) -> Result<String, String> {
 fn call_tool(name: &str, args: &Value) -> Result<String, String> {
     match name {
         "browse" => call_browse(args),
-        "pdf_extract" => pdf_extract(args),
-        "youtube_transcript" => youtube_transcript(args),
+        "browse_pdf" | "pdf_extract" => pdf_extract(args),
+        "browse_youtube" | "youtube_transcript" => youtube_transcript(args),
         "gh_clone" => gh_clone(args),
         other => Err(format!("unknown tool: {other}")),
     }
@@ -631,21 +633,78 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
+const TEXT_CAP: usize = 30_000;
+
 /// Head+tail cap: ~30k chars total, the middle elided.
 fn cap_text(s: &str) -> String {
-    const CAP: usize = 30_000;
-    if s.len() <= CAP {
+    cap_with_note(s, None)
+}
+
+/// `cap_text` whose elision marker carries an extra note (the spill path).
+fn cap_with_note(s: &str, note: Option<String>) -> String {
+    if s.len() <= TEXT_CAP {
         return s.to_string();
     }
-    let mut head = CAP * 2 / 3;
+    let mut head = TEXT_CAP * 2 / 3;
     while !s.is_char_boundary(head) {
         head -= 1;
     }
-    let mut tail = s.len() - CAP / 3;
+    let mut tail = s.len() - TEXT_CAP / 3;
     while !s.is_char_boundary(tail) {
         tail += 1;
     }
-    format!("{}\n\n[… {} bytes elided …]\n\n{}", &s[..head], tail - head, &s[tail..])
+    let marker = match note {
+        Some(n) => format!("… {} bytes elided — {n} …", tail - head),
+        None => format!("… {} bytes elided …", tail - head),
+    };
+    format!("{}\n\n[{marker}]\n\n{}", &s[..head], &s[tail..])
+}
+
+/// Filename slug from a URL/path tail: "a/b/My PDF.pdf" → "my-pdf".
+fn slug(s: &str) -> String {
+    let base = s.rsplit('/').next().unwrap_or(s);
+    let base = base
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(base);
+    let mut out = String::new();
+    let mut dash = false;
+    for c in base.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    let out = out.trim_end_matches('-');
+    if out.is_empty() {
+        "document".into()
+    } else {
+        out.chars().take(60).collect()
+    }
+}
+
+/// Spill large extracted text to ~/.gray/browse/pdf/<slug>-<pid>.txt → path.
+fn spill_pdf_text(text: &str, src: &str) -> Option<std::path::PathBuf> {
+    let dir = gray_home().join("browse").join("pdf");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}-{}.txt", slug(src), std::process::id()));
+    std::fs::write(&path, text).ok()?;
+    Some(path)
+}
+
+/// Cap the extracted text; over the cap the full text spills to disk first
+/// and the elision marker names the file.
+fn pdf_result(text: &str, src: &str) -> String {
+    let trimmed = text.trim_end();
+    let note = if trimmed.len() > TEXT_CAP {
+        spill_pdf_text(trimmed, src).map(|p| format!("full text: {}", p.display()))
+    } else {
+        None
+    };
+    cap_with_note(trimmed, note)
 }
 
 /// "1-5" or "3" → (first, last); missing/empty → all pages.
@@ -702,15 +761,19 @@ const PYPDF_SCRIPT: &str = concat!(
     "    sys.stdout.write((r.pages[i].extract_text() or '') + '\\n')\n",
 );
 
-/// pdftotext (poppler) → python3+pypdf → friendly install hint.
+/// pdftotext (poppler) → python3+pypdf → lopdf (built-in, always there).
 fn pdf_text(path: &std::path::Path, first: u32, last: u32) -> Result<String, String> {
+    let mut errs = Vec::new();
     if on_path("pdftotext") {
         let mut cmd = std::process::Command::new("pdftotext");
         cmd.arg("-f").arg(first.to_string());
         if last != u32::MAX {
             cmd.arg("-l").arg(last.to_string());
         }
-        return run_stdout(cmd.arg(path).arg("-"), "pdftotext");
+        match run_stdout(cmd.arg(path).arg("-"), "pdftotext") {
+            Ok(t) => return Ok(t),
+            Err(e) => errs.push(e),
+        }
     }
     let has_pypdf = std::process::Command::new("python3")
         .args(["-c", "import pypdf"])
@@ -721,7 +784,7 @@ fn pdf_text(path: &std::path::Path, first: u32, last: u32) -> Result<String, Str
         .map(|s| s.success())
         .unwrap_or(false);
     if has_pypdf {
-        return run_stdout(
+        match run_stdout(
             std::process::Command::new("python3")
                 .arg("-c")
                 .arg(PYPDF_SCRIPT)
@@ -729,12 +792,32 @@ fn pdf_text(path: &std::path::Path, first: u32, last: u32) -> Result<String, Str
                 .arg(first.to_string())
                 .arg(last.to_string()),
             "pypdf",
-        );
+        ) {
+            Ok(t) => return Ok(t),
+            Err(e) => errs.push(e),
+        }
     }
-    Err("no pdf extractor (install poppler-utils)".into())
+    match lopdf_text(path, first, last) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            errs.push(e);
+            Err(format!("no pdf extractor worked ({})", errs.join("; ")))
+        }
+    }
 }
 
-/// pdf_extract {url_or_path, pages?} — fetch/read a PDF, extract its text.
+/// Built-in fallback: lopdf page-range text extraction.
+fn lopdf_text(path: &std::path::Path, first: u32, last: u32) -> Result<String, String> {
+    let doc = lopdf::Document::load(path).map_err(|e| format!("lopdf: {e}"))?;
+    let n = doc.get_pages().len() as u32;
+    if first > n {
+        return Err(format!("lopdf: only {n} page(s)"));
+    }
+    let pages: Vec<u32> = (first..=last.min(n)).collect();
+    doc.extract_text(&pages).map_err(|e| format!("lopdf: {e}"))
+}
+
+/// browse_pdf {url_or_path, pages?} — fetch/read a PDF, extract its text.
 fn pdf_extract(args: &Value) -> Result<String, String> {
     let src = args.get("url_or_path").and_then(Value::as_str).unwrap_or("").trim();
     if src.is_empty() {
@@ -761,10 +844,10 @@ fn pdf_extract(args: &Value) -> Result<String, String> {
     if text.trim().is_empty() {
         return Ok(format!("(no extractable text in {src})"));
     }
-    Ok(cap_text(text.trim_end()))
+    Ok(pdf_result(&text, src))
 }
 
-/// youtube_transcript {url} — yt-dlp subtitles first, timedtext fallback.
+/// browse_youtube {url} — yt-dlp subtitles first, timedtext fallback.
 fn youtube_transcript(args: &Value) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str).unwrap_or("").trim();
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -1170,7 +1253,7 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names, ["browse", "pdf_extract", "youtube_transcript", "gh_clone"]);
+        assert_eq!(names, ["browse", "browse_pdf", "browse_youtube", "gh_clone"]);
     }
 
     #[test]
@@ -1195,11 +1278,11 @@ mod tests {
 
     #[test]
     fn pdf_extract_validates_args() {
-        let r = call("tool/call", json!({ "name": "pdf_extract", "args": {} }));
+        let r = call("tool/call", json!({ "name": "browse_pdf", "args": {} }));
         assert_eq!(r["result"]["is_error"], true);
         let r = call(
             "tool/call",
-            json!({ "name": "pdf_extract", "args": { "url_or_path": "/no/such/file.pdf" } }),
+            json!({ "name": "browse_pdf", "args": { "url_or_path": "/no/such/file.pdf" } }),
         );
         assert_eq!(r["result"]["is_error"], true);
         assert!(
@@ -1211,7 +1294,7 @@ mod tests {
     fn new_tools_validate_before_touching_anything() {
         let r = call(
             "tool/call",
-            json!({ "name": "youtube_transcript", "args": { "url": "not-a-url" } }),
+            json!({ "name": "browse_youtube", "args": { "url": "not-a-url" } }),
         );
         assert_eq!(r["result"]["is_error"], true);
         let r = call("tool/call", json!({ "name": "gh_clone", "args": { "repo": "x" } }));
@@ -1237,6 +1320,82 @@ mod tests {
         let out = parse_timedtext(xml);
         assert!(out.contains("[0:00] hello & welcome"), "{out}");
         assert!(out.contains("[1:02] second line"), "{out}");
+    }
+
+    #[test]
+    fn legacy_tool_names_still_dispatch() {
+        let r = call("tool/call", json!({ "name": "pdf_extract", "args": {} }));
+        assert!(
+            r["result"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("url_or_path")
+        );
+        let r = call(
+            "tool/call",
+            json!({ "name": "youtube_transcript", "args": { "url": "x" } }),
+        );
+        assert!(r["result"]["content"].as_str().unwrap().contains("http"));
+    }
+
+    #[test]
+    fn pdf_result_spills_big_text_to_disk() {
+        let dir = std::env::temp_dir().join(format!("gray-browse-home-{}", std::process::id()));
+        unsafe { std::env::set_var("GRAY_HOME", &dir) };
+        let big = "x".repeat(40_000);
+        let out = pdf_result(&big, "https://x/paper.pdf");
+        assert!(out.contains("full text: "), "{out}");
+        let spill = dir
+            .join("browse")
+            .join("pdf")
+            .join(format!("paper-{}.txt", std::process::id()));
+        assert_eq!(std::fs::read_to_string(&spill).unwrap().len(), 40_000);
+        unsafe { std::env::remove_var("GRAY_HOME") };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pdf_result("small", "s"), "small");
+    }
+
+    #[test]
+    fn slugs_come_from_path_tails() {
+        assert_eq!(slug("https://x/a/My Paper.pdf"), "my-paper");
+        assert_eq!(slug("/tmp/report_2024"), "report-2024");
+        assert_eq!(slug(""), "document");
+    }
+
+    #[test]
+    fn lopdf_extracts_page_text() {
+        use lopdf::{Document, Object, Stream, dictionary};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let content = Stream::new(
+            dictionary! {},
+            b"BT /F1 24 Tf 100 700 Td (Hello PDF) Tj ET".to_vec(),
+        );
+        let content_id = doc.add_object(content);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        });
+        let pages = dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let path = std::env::temp_dir().join(format!("gray-browse-test-{}.pdf", std::process::id()));
+        doc.save(&path).unwrap();
+        let text = lopdf_text(&path, 1, u32::MAX).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("Hello PDF"), "{text}");
+        assert!(lopdf_text(&path, 2, u32::MAX).is_err());
     }
 
     #[test]
