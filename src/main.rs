@@ -19,6 +19,7 @@
 //! `youtube_transcript` still dispatch as aliases.
 
 use std::io::{BufRead, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 
@@ -90,20 +91,17 @@ struct Fetch {
 
 /// curl → body capped at MAX_BODY + last HTTP status from dumped headers.
 fn fetch(url: &str) -> Result<Fetch, String> {
+    // Header dump goes to a temp file: /dev/stderr doesn't exist on Windows.
+    static DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let dump = std::env::temp_dir().join(format!(
+        "gray-browse-{}-{}.hdr",
+        std::process::id(),
+        DUMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut child = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-L",
-            "--max-time",
-            "20",
-            "--compressed",
-            "-D",
-            "/dev/stderr",
-            "-A",
-            UA,
-            "--",
-            url,
-        ])
+        .args(["-sS", "-L", "--max-time", "20", "--compressed", "-D"])
+        .arg(&dump)
+        .args(["-A", UA, "--", url])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -133,21 +131,21 @@ fn fetch(url: &str) -> Result<Fetch, String> {
         let _ = child.kill();
     }
     let exit = child.wait().map_err(|e| format!("curl wait failed: {e}"))?;
-    let mut headers = String::new();
+    let headers = std::fs::read_to_string(&dump).unwrap_or_default();
+    let _ = std::fs::remove_file(&dump);
+    let mut errors = String::new();
     if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut headers);
+        let _ = err.read_to_string(&mut errors);
     }
     let status = headers
         .lines()
-        .filter(|l| l.starts_with("HTTP/"))
-        .last()
+        .rfind(|l| l.starts_with("HTTP/"))
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|n| n.parse::<u16>().ok());
     if !exit.success() && !capped {
-        let detail = headers
+        let detail = errors
             .lines()
-            .filter(|l| l.starts_with("curl:"))
-            .last()
+            .rfind(|l| l.starts_with("curl:"))
             .unwrap_or("unknown error")
             .trim()
             .to_string();
@@ -567,10 +565,10 @@ fn call_browse(args: &Value) -> Result<String, String> {
         return firecrawl(url, key.as_deref().unwrap_or(""));
     }
     let page = fetch(url)?;
-    if let Some(code) = page.status {
-        if code >= 400 {
-            return Err(format!("HTTP {code} from {url}"));
-        }
+    if let Some(code) = page.status
+        && code >= 400
+    {
+        return Err(format!("HTTP {code} from {url}"));
     }
     let html = String::from_utf8_lossy(&page.body).to_string();
     let text = match action {
@@ -605,12 +603,25 @@ fn call_browse(args: &Value) -> Result<String, String> {
 
 /// `prog` on PATH (or an existing file when it contains '/').
 fn on_path(prog: &str) -> bool {
-    if prog.contains('/') {
+    if prog.contains('/') || prog.contains('\\') {
         return std::path::Path::new(prog).is_file();
     }
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
-        .unwrap_or(false)
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let dirs: Vec<_> = std::env::split_paths(&paths).collect();
+    if dirs.iter().any(|d| d.join(prog).is_file()) {
+        return true;
+    }
+    // Windows resolves `name.<ext>` via PATHEXT (.COM;.EXE;.BAT;.CMD;...).
+    if cfg!(windows) {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        return pathext.split(';').filter(|e| !e.is_empty()).any(|ext| {
+            dirs.iter()
+                .any(|d| d.join(format!("{prog}{ext}")).is_file())
+        });
+    }
+    false
 }
 
 /// `~/.gray`, honoring `GRAY_HOME` like the other gray plugins.
@@ -618,6 +629,9 @@ fn gray_home() -> std::path::PathBuf {
     std::env::var_os("GRAY_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".gray")))
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join(".gray"))
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
@@ -663,10 +677,7 @@ fn cap_with_note(s: &str, note: Option<String>) -> String {
 /// Filename slug from a URL/path tail: "a/b/My PDF.pdf" → "my-pdf".
 fn slug(s: &str) -> String {
     let base = s.rsplit('/').next().unwrap_or(s);
-    let base = base
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(base);
+    let base = base.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(base);
     let mut out = String::new();
     let mut dash = false;
     for c in base.chars() {
@@ -746,7 +757,13 @@ fn run_stdout(cmd: &mut std::process::Command, what: &str) -> Result<String, Str
         .map_err(|e| format!("couldn't run {what}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        let detail: String = err.lines().last().unwrap_or("failed").chars().take(200).collect();
+        let detail: String = err
+            .lines()
+            .last()
+            .unwrap_or("failed")
+            .chars()
+            .take(200)
+            .collect();
         return Err(format!("{what}: {detail}"));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -775,17 +792,22 @@ fn pdf_text(path: &std::path::Path, first: u32, last: u32) -> Result<String, Str
             Err(e) => errs.push(e),
         }
     }
-    let has_pypdf = std::process::Command::new("python3")
-        .args(["-c", "import pypdf"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    let python = ["python3", "python"].into_iter().find(|p| on_path(p));
+    let has_pypdf = python
+        .and_then(|py| {
+            std::process::Command::new(py)
+                .args(["-c", "import pypdf"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+        })
         .map(|s| s.success())
         .unwrap_or(false);
     if has_pypdf {
         match run_stdout(
-            std::process::Command::new("python3")
+            std::process::Command::new(python.unwrap())
                 .arg("-c")
                 .arg(PYPDF_SCRIPT)
                 .arg(path)
@@ -819,17 +841,21 @@ fn lopdf_text(path: &std::path::Path, first: u32, last: u32) -> Result<String, S
 
 /// browse_pdf {url_or_path, pages?} — fetch/read a PDF, extract its text.
 fn pdf_extract(args: &Value) -> Result<String, String> {
-    let src = args.get("url_or_path").and_then(Value::as_str).unwrap_or("").trim();
+    let src = args
+        .get("url_or_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if src.is_empty() {
         return Err("missing required argument: url_or_path".into());
     }
     let (first, last) = parse_pages(args.get("pages").and_then(Value::as_str))?;
     let path = if src.starts_with("http://") || src.starts_with("https://") {
         let page = fetch(src)?;
-        if let Some(code) = page.status {
-            if code >= 400 {
-                return Err(format!("HTTP {code} from {src}"));
-            }
+        if let Some(code) = page.status
+            && code >= 400
+        {
+            return Err(format!("HTTP {code} from {src}"));
         }
         let tmp = std::env::temp_dir().join(format!("gray-browse-{}.pdf", std::process::id()));
         std::fs::write(&tmp, &page.body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -906,7 +932,13 @@ fn yt_dlp_subs(url: &str) -> Result<String, String> {
         .flatten();
     let Some(srt) = srt else {
         let err = String::from_utf8_lossy(&out.stderr);
-        let detail: String = err.lines().last().unwrap_or("no subtitles").chars().take(200).collect();
+        let detail: String = err
+            .lines()
+            .last()
+            .unwrap_or("no subtitles")
+            .chars()
+            .take(200)
+            .collect();
         return Err(format!("yt-dlp: no .srt produced ({detail})"));
     };
     std::fs::read_to_string(&srt).map_err(|e| format!("yt-dlp: read {}: {e}", srt.display()))
@@ -956,7 +988,10 @@ fn parse_timedtext(xml: &str) -> String {
         let secs = attr(&rest[i..gt], "start")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0) as u64;
-        let end = rest[gt..].find("</text>").map(|e| gt + e).unwrap_or(rest.len());
+        let end = rest[gt..]
+            .find("</text>")
+            .map(|e| gt + e)
+            .unwrap_or(rest.len());
         let inner = decode_entities(&rest[(gt + 1).min(rest.len())..end.min(rest.len())]);
         let inner = inner.split_whitespace().collect::<Vec<_>>().join(" ");
         if !inner.is_empty() {
@@ -975,8 +1010,13 @@ fn timedtext_transcript(url: &str) -> Result<String, String> {
     }
     let page = fetch(url)?;
     let html = String::from_utf8_lossy(&page.body);
-    let i = html.find("\"captionTracks\"").ok_or("no captionTracks in watch page")?;
-    let start = html[i..].find('[').map(|s| i + s).ok_or("captionTracks: no array")?;
+    let i = html
+        .find("\"captionTracks\"")
+        .ok_or("no captionTracks in watch page")?;
+    let start = html[i..]
+        .find('[')
+        .map(|s| i + s)
+        .ok_or("captionTracks: no array")?;
     let arr = json_array_at(&html, start).ok_or("captionTracks: malformed array")?;
     let tracks: Value = serde_json::from_str(arr).map_err(|e| format!("captionTracks: {e}"))?;
     let tracks = tracks.as_array().cloned().unwrap_or_default();
@@ -987,9 +1027,11 @@ fn timedtext_transcript(url: &str) -> Result<String, String> {
         .iter()
         .find(|t| t["languageCode"].as_str() == Some("en"))
         .or_else(|| {
-            tracks
-                .iter()
-                .find(|t| t["languageCode"].as_str().is_some_and(|l| l.starts_with("en")))
+            tracks.iter().find(|t| {
+                t["languageCode"]
+                    .as_str()
+                    .is_some_and(|l| l.starts_with("en"))
+            })
         })
         .unwrap_or(&tracks[0]);
     let base = track["baseUrl"].as_str().ok_or("track has no baseUrl")?;
@@ -1016,8 +1058,15 @@ fn parse_repo(repo: &str) -> Result<(String, String), String> {
         return Ok((repo.to_string(), name.to_string()));
     }
     let parts: Vec<&str> = repo.split('/').collect();
-    if parts.len() == 2 && parts.iter().all(|p| !p.is_empty() && !p.contains(char::is_whitespace)) {
-        return Ok((format!("https://github.com/{repo}.git"), parts[1].to_string()));
+    if parts.len() == 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && !p.contains(char::is_whitespace))
+    {
+        return Ok((
+            format!("https://github.com/{repo}.git"),
+            parts[1].to_string(),
+        ));
     }
     Err(format!("repo '{repo}' must be owner/name or a git URL"))
 }
@@ -1046,7 +1095,11 @@ fn count_files(dir: &std::path::Path) -> usize {
 
 /// gh_clone {repo, dest?} — shallow clone into ~/.gray/browse/repos/<name>.
 fn gh_clone(args: &Value) -> Result<String, String> {
-    let repo = args.get("repo").and_then(Value::as_str).unwrap_or("").trim();
+    let repo = args
+        .get("repo")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     let (url, name) = parse_repo(repo)?;
     let dest = match args
         .get("dest")
@@ -1084,10 +1137,20 @@ fn gh_clone(args: &Value) -> Result<String, String> {
     if !out.status.success() {
         let _ = std::fs::remove_dir_all(&dest);
         let err = String::from_utf8_lossy(&out.stderr);
-        let detail: String = err.lines().last().unwrap_or("clone failed").chars().take(200).collect();
+        let detail: String = err
+            .lines()
+            .last()
+            .unwrap_or("clone failed")
+            .chars()
+            .take(200)
+            .collect();
         return Err(format!("git clone: {detail}"));
     }
-    Ok(format!("cloned to {} ({} files)", dest.display(), count_files(&dest)))
+    Ok(format!(
+        "cloned to {} ({} files)",
+        dest.display(),
+        count_files(&dest)
+    ))
 }
 
 /// One request → `Some(reply)`, or `None` for notifications. The bool asks
@@ -1253,7 +1316,10 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names, ["browse", "browse_pdf", "browse_youtube", "gh_clone"]);
+        assert_eq!(
+            names,
+            ["browse", "browse_pdf", "browse_youtube", "gh_clone"]
+        );
     }
 
     #[test]
@@ -1286,7 +1352,10 @@ mod tests {
         );
         assert_eq!(r["result"]["is_error"], true);
         assert!(
-            r["result"]["content"].as_str().unwrap().contains("no such file")
+            r["result"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("no such file")
         );
     }
 
@@ -1297,10 +1366,18 @@ mod tests {
             json!({ "name": "browse_youtube", "args": { "url": "not-a-url" } }),
         );
         assert_eq!(r["result"]["is_error"], true);
-        let r = call("tool/call", json!({ "name": "gh_clone", "args": { "repo": "x" } }));
+        let r = call(
+            "tool/call",
+            json!({ "name": "gh_clone", "args": { "repo": "x" } }),
+        );
         assert_eq!(r["result"]["is_error"], true);
         let r = call("tool/call", json!({ "name": "nope", "args": {} }));
-        assert!(r["result"]["content"].as_str().unwrap().contains("unknown tool"));
+        assert!(
+            r["result"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool")
+        );
     }
 
     #[test]
@@ -1390,7 +1467,8 @@ mod tests {
         doc.objects.insert(pages_id, Object::Dictionary(pages));
         let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
         doc.trailer.set("Root", catalog_id);
-        let path = std::env::temp_dir().join(format!("gray-browse-test-{}.pdf", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("gray-browse-test-{}.pdf", std::process::id()));
         doc.save(&path).unwrap();
         let text = lopdf_text(&path, 1, u32::MAX).unwrap();
         let _ = std::fs::remove_file(&path);
